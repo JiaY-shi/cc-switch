@@ -1,0 +1,107 @@
+name: Build macOS DMG (with ephemeral signing)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Cache pnpm store
+        uses: actions/cache@v5
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate ephemeral Tauri signing key
+        id: gen_key
+        run: |
+          # 生成临时密钥对 (私钥 + 公钥)
+          # 使用 tauri signer generate，直接输出到当前目录
+          pnpm tauri signer generate -w ephemeral.key
+          # 读取公钥内容
+          PUBKEY=$(cat ephemeral.key.pub)
+          # 读取私钥内容（多行）
+          PRIVKEY=$(cat ephemeral.key)
+          # 将私钥内容写入环境变量文件（多行格式需要特殊处理）
+          echo "PRIVKEY<<EOF" >> $GITHUB_ENV
+          echo "$PRIVKEY" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "PUBKEY=$PUBKEY" >> $GITHUB_ENV
+          # 同时设置输出供后续步骤使用
+          echo "pubkey=$PUBKEY" >> $GITHUB_OUTPUT
+
+      - name: Inject pubkey into tauri.conf.json
+        run: |
+          # 使用 jq 将公钥写入 updater 配置（如果 updater 不存在则创建）
+          jq --arg pubkey "${{ env.PUBKEY }}" \
+            '.plugins.updater = (.plugins.updater // {}) | .plugins.updater.pubkey = $pubkey' \
+            src-tauri/tauri.conf.json > tmp.json
+          mv tmp.json src-tauri/tauri.conf.json
+          echo "=== Updated tauri.conf.json plugins.updater ==="
+          jq '.plugins.updater' src-tauri/tauri.conf.json
+
+      - name: Build universal macOS app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.PRIVKEY }}
+          # 不需要密码，临时密钥为空密码
+        run: pnpm tauri build --target universal-apple-darwin
+
+      - name: Locate .app
+        id: app
+        run: |
+          APP_PATH=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -name "*.app" -type d | head -1)
+          echo "path=$APP_PATH" >> $GITHUB_OUTPUT
+          echo "name=$(basename "$APP_PATH" .app)" >> $GITHUB_OUTPUT
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Create DMG
+        run: |
+          APP_PATH="${{ steps.app.outputs.path }}"
+          APP_NAME="${{ steps.app.outputs.name }}"
+          VERSION="${GITHUB_REF_NAME:-latest}"
+          DMG_NAME="CC-Switch-${VERSION}-macOS.dmg"
+          STAGE="dmg-stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R "$APP_PATH" "$STAGE/"
+          create-dmg \
+            --volname "$APP_NAME" \
+            --window-size 660 400 \
+            --icon-size 80 \
+            --icon "$APP_NAME.app" 180 220 \
+            --app-drop-link 480 220 \
+            --no-internet-enable \
+            "$DMG_NAME" \
+            "$STAGE"
+          echo "dmg_name=$DMG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: CC-Switch-macOS-DMG
+          path: "*.dmg"
